@@ -4,6 +4,7 @@ Dark-mode Streamlit UI with Win Probability Gauge, Assassin Feed, Presser Summar
 """
 
 import os
+import requests
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import fpl_api
 import simulator as sim
-import nlp_utils  # uses Groq llama-3.3-70b via OpenRouter
+import nlp_utils  # uses OpenRouter (meta-llama/llama-3.3-70b-instruct)
 
 # Resolve API key: Streamlit Cloud secrets → env var → empty (shows input field)
 def _resolve_api_key() -> str:
@@ -20,6 +21,25 @@ def _resolve_api_key() -> str:
         return st.secrets["OPENROUTER_API_KEY"]
     except Exception:
         return os.getenv("OPENROUTER_API_KEY", "")
+
+
+@st.cache_data(ttl=300)
+def _fetch_fpl_data(gw: int) -> tuple[dict, pd.DataFrame, dict]:
+    """Fetch bootstrap once per 5-minute window; derive players_df and gw_info from it."""
+    bs      = fpl_api.get_bootstrap()
+    pdf     = fpl_api.get_players_df(bs)
+    gw_info = fpl_api.get_gw_info(gw, bs)
+    return bs, pdf, gw_info
+
+
+@st.cache_data(ttl=300)
+def _fetch_standings(league_id: int) -> list[dict]:
+    return fpl_api.get_top_n_managers(league_id, n=5)
+
+
+@st.cache_data(ttl=300)
+def _fetch_picks(manager_id: int, gw: int) -> list[int]:
+    return fpl_api.get_manager_picks(manager_id, gw)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -31,53 +51,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Colors and base theme (backgroundColor, primaryColor, textColor) are set in
+# .streamlit/config.toml. Only inject CSS that config.toml cannot express.
 DARK_CSS = """
 <style>
-  body, .stApp { background-color: #0d0d0d; color: #e0e0e0; }
   .block-container { padding: 1.5rem 2rem; }
-  h1 { color: #00e5ff; font-family: 'Courier New', monospace; letter-spacing: 3px; }
+  h1 { font-family: 'Courier New', monospace; letter-spacing: 3px; }
   h2, h3 { color: #b0bec5; }
   .metric-card {
     background: #1a1a2e; border: 1px solid #00e5ff33;
     border-radius: 12px; padding: 1rem; text-align: center;
   }
   .assassin-row { border-left: 3px solid #ff1744; padding-left: 8px; margin-bottom: 4px; }
-  section[data-testid="stSidebar"] { background-color: #111122; }
   .stButton>button { background: #00e5ff22; border: 1px solid #00e5ff; color: #00e5ff; }
   .stButton>button:hover { background: #00e5ff44; }
 </style>
 """
 st.markdown(DARK_CSS, unsafe_allow_html=True)
-
-# Patch Streamlit's empty autocomplete="" attributes for accessibility compliance.
-# Maps aria-label → valid autocomplete token. Runs once after DOM settles.
-st.markdown("""
-<script>
-(function patchAutocomplete() {
-  const map = {
-    "Player name":              "name",
-    "Player ID (FPL)":          "off",
-    "Paste press conference quote": "off",
-    "Groq API Key":             "current-password",
-    "Your Manager ID":          "off",
-    "Mini-League ID":           "off",
-    "Current GW":               "off",
-    "GWs Remaining":            "off",
-  };
-  function apply() {
-    document.querySelectorAll("input[autocomplete=''], textarea[autocomplete='']")
-      .forEach(el => {
-        const label = el.getAttribute("aria-label") || el.getAttribute("placeholder") || "";
-        const token = Object.entries(map).find(([k]) => label.includes(k));
-        el.setAttribute("autocomplete", token ? token[1] : "off");
-      });
-  }
-  // Run immediately, then observe for Streamlit re-renders
-  apply();
-  new MutationObserver(apply).observe(document.body, { childList: true, subtree: true });
-})();
-</script>
-""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Session state init
@@ -86,6 +76,16 @@ for key in ("bootstrap", "players_df", "sim_results", "assassins", "pressers", "
             "transfer_result", "target_profile", "leader_profile", "sim_cfg", "captain_id"):
     if key not in st.session_state:
         st.session_state[key] = None
+
+
+def _valid_df(key: str, required_cols: tuple = ()) -> "pd.DataFrame | None":
+    """Return session DataFrame only if it's a non-empty DataFrame with expected columns."""
+    val = st.session_state.get(key)
+    if not isinstance(val, pd.DataFrame) or val.empty:
+        return None
+    if required_cols and not all(c in val.columns for c in required_cols):
+        return None
+    return val
 
 # ---------------------------------------------------------------------------
 # Sidebar – Configuration
@@ -127,7 +127,7 @@ with st.sidebar:
     # BGW Alert — count how many of the target squad are blanking
     _gw   = st.session_state.gw_info
     _tp2  = st.session_state.target_profile
-    _pdf2 = st.session_state.players_df
+    _pdf2 = _valid_df("players_df", ("id", "team", "web_name"))
     if _gw and _gw.get("is_bgw") and _tp2 and _pdf2 is not None:
         bgw_t    = _gw.get("bgw_teams", set())
         bgw_sq   = _pdf2[
@@ -150,7 +150,7 @@ with st.sidebar:
 
     st.markdown("### Captain Selector")
     _tp  = st.session_state.target_profile
-    _pdf = st.session_state.players_df
+    _pdf = _valid_df("players_df", ("id", "ppg", "web_name"))
     if _tp is not None and _pdf is not None:
         _squad_cap = _pdf[_pdf["id"].isin(_tp.squad_player_ids)].sort_values("ppg", ascending=False)
         _cap_names = _squad_cap["web_name"].tolist()
@@ -171,7 +171,7 @@ with st.sidebar:
 st.markdown("# ⚡ C L U T C H")
 st.caption("Elite FPL Strategy Engine – Monte Carlo | Assassin | Coach-Speak AI")
 
-col_gauge, col_assassin, col_presser = st.columns([1.2, 1.4, 1.4])
+col_gauge, col_assassin, col_presser = st.tabs(["📊 Win Probability", "🎯 Assassin Feed", "🧠 Presser Intel"])
 
 # ---------------------------------------------------------------------------
 # Helper: Win Probability Gauge
@@ -216,14 +216,14 @@ def draw_assassin_table(df: pd.DataFrame) -> go.Figure:
 
     fig = go.Figure(go.Table(
         header=dict(
-            values=["Player", "xGA", "Own%", "Rivals Own", "Action"],
+            values=["Player", "xGI", "Own%", "Rivals Own", "Action"],
             fill_color="#1a1a2e", font=dict(color="#00e5ff", size=12),
             align="left",
         ),
         cells=dict(
             values=[
                 top["display_name"],
-                top["xGA"].round(2),
+                top["xGI"].round(2),
                 top["ownership_pct"].round(1),
                 top["rival_ownership_count"],
                 top["target_owns"].map({True: "✅ Hold", False: "🔴 BUY"}),
@@ -270,35 +270,26 @@ def draw_sparkline(result: dict) -> go.Figure:
 if run_btn:
     with st.spinner("Fetching FPL data..."):
         try:
-            bs       = fpl_api.get_bootstrap()
-            pdf      = fpl_api.get_players_df(bs)
-            gw_info  = fpl_api.get_gw_info(gameweek, bs)
+            bs, pdf, gw_info = _fetch_fpl_data(gameweek)
             st.session_state.bootstrap  = bs
             st.session_state.players_df = pdf
             st.session_state.gw_info    = gw_info
 
-            # Manager info
+            # Manager info + target picks — cached per (manager_id, gw)
             t_info  = fpl_api.get_manager_info(target_id)
             t_name  = f"{t_info['player_first_name']} {t_info['player_last_name']}"
             t_pts   = t_info["summary_overall_points"]
-            t_picks = fpl_api.get_manager_picks(target_id, gameweek)
+            t_picks = _fetch_picks(target_id, gameweek)
 
-            # League top 5
-            top5      = fpl_api.get_top_n_managers(league_id, 5)
-            rivals    = [m for m in top5 if m["entry"] != target_id]
-            leader_m  = top5[0] if top5[0]["entry"] != target_id else top5[1]
+            # League standings — cached per league_id
+            top5     = _fetch_standings(league_id)
+            rivals   = [m for m in top5 if m["entry"] != target_id]
+            leader_m = top5[0] if top5[0]["entry"] != target_id else top5[1]
 
-            # Assassin feed (pass BGW teams so blanking players are flagged)
-            assassins = fpl_api.compute_ownership_gap(
-                target_id=target_id, league_id=league_id,
-                gameweek=gameweek, players_df=pdf,
-                bgw_teams=gw_info.get("bgw_teams", set()),
-            )
-            st.session_state.assassins = assassins
-
-            # Build profiles
+            # Build rival profiles — _fetch_picks is cached so each manager_id
+            # is fetched once and reused everywhere in this run
             def _profile(m: dict) -> sim.ManagerProfile:
-                picks = fpl_api.get_manager_picks(m["entry"], gameweek)
+                picks = _fetch_picks(m["entry"], gameweek)
                 return sim.ManagerProfile(
                     manager_id=m["entry"],
                     name=m["player_name"],
@@ -308,6 +299,25 @@ if run_btn:
 
             with ThreadPoolExecutor(max_workers=4) as pool:
                 rival_profiles = list(pool.map(_profile, rivals))
+
+            # Extract rival picks from already-built profiles (zero extra requests)
+            rival_picks_dict = {p.manager_id: p.squad_player_ids for p in rival_profiles}
+
+            # leader_profile already exists in rival_profiles — no extra fetch
+            leader_profile = next(
+                p for p in rival_profiles if p.manager_id == leader_m["entry"]
+            )
+
+            # Assassin feed — all picks forwarded, no internal re-fetching
+            assassins = fpl_api.compute_ownership_gap(
+                target_id=target_id, league_id=league_id,
+                gameweek=gameweek, players_df=pdf,
+                bgw_teams=gw_info.get("bgw_teams", set()),
+                top5_standings=top5,
+                target_picks=t_picks,
+                rival_picks=rival_picks_dict,
+            )
+            st.session_state.assassins = assassins
 
             # Auto-select captain as highest-PPG squad player if not manually chosen
             stored_cap = st.session_state.captain_id
@@ -323,26 +333,18 @@ if run_btn:
                 squad_player_ids=t_picks,
                 captain_id=stored_cap,
             )
-            leader_profile = _profile(leader_m)
 
-            # Detect DGW players: fetch fixtures for current GW, flag players with 2 fixtures
-            try:
-                import requests
-                fixtures = requests.get(
-                    f"https://fantasy.premierleague.com/api/fixtures/?event={gameweek}",
-                    headers={"User-Agent": "CLUTCH-FPL-Engine/1.0"}, timeout=10,
-                ).json()
-                dgw_teams = {t for f in fixtures for t in (f["team_h"], f["team_a"])
-                             if sum(1 for x in fixtures
-                                    if t in (x["team_h"], x["team_a"])) > 1}
-                dgw_pids  = set(pdf[pdf["team"].isin(dgw_teams)]["id"].tolist())
-            except Exception:
-                dgw_pids = set()
+            # DGW/BGW player sets come from gw_info (already fetched above)
+            dgw_teams = gw_info.get("dgw_teams", set())
+            bgw_teams = gw_info.get("bgw_teams", set())
+            dgw_pids  = set(pdf[pdf["team"].isin(dgw_teams)]["id"].tolist())
+            bgw_pids  = set(pdf[pdf["team"].isin(bgw_teams)]["id"].tolist())
 
             cfg = sim.SimulationConfig(
                 n_iterations=n_iter,
                 remaining_gws=remaining,
                 dgw_player_ids=dgw_pids,
+                bgw_player_ids=bgw_pids,
             )
             result = sim.simulate_season(target_profile, leader_profile, pdf, cfg)
             st.session_state.sim_results     = result
@@ -350,8 +352,28 @@ if run_btn:
             st.session_state.leader_profile  = leader_profile
             st.session_state.sim_cfg         = cfg
 
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            url    = e.response.url         if e.response is not None else ""
+            if status == 404:
+                if f"/entry/{target_id}" in url:
+                    st.error(
+                        f"Manager ID **{target_id}** was not found on FPL. "
+                        f"Check your ID at fantasy.premierleague.com/entry/{target_id}/history."
+                    )
+                elif f"/leagues-classic/{league_id}" in url:
+                    st.error(
+                        f"League ID **{league_id}** was not found. "
+                        "Verify the ID in the mini-league URL on the FPL website."
+                    )
+                else:
+                    st.error("An FPL resource returned 404. Check your Manager ID and League ID.")
+            elif status == 429:
+                st.error("FPL API rate limit reached. Wait 60 seconds then try again.")
+            else:
+                st.error(f"FPL API returned HTTP {status}. Try again in a moment.")
         except Exception as e:
-            st.error(f"API error: {e}")
+            st.error(f"Unexpected error: {e}")
 
 # Presser analysis (independent of main run)
 if run_presser and presser_quote and presser_player:
@@ -388,19 +410,27 @@ with col_gauge:
             st.markdown(
                 "<div style='background:#ff980022;border:1px solid #ff9800;"
                 "border-radius:8px;padding:6px 12px;margin-bottom:8px;"
-                "color:#ff9800;font-size:13px'>⚡ <b>Double GW detected</b> — "
-                f"σ elevated to {res.get('target_sigma', 12):.0f} pts</div>",
+                "color:#ff9800;font-size:13px'>⚡ <b>Double GW</b> — "
+                "players with 2 fixtures get two independent score draws</div>",
+                unsafe_allow_html=True,
+            )
+        if res.get("bgw_active"):
+            st.markdown(
+                "<div style='background:#ff174422;border:1px solid #ff1744;"
+                "border-radius:8px;padding:6px 12px;margin-bottom:8px;"
+                "color:#ff6e6e;font-size:13px'>❌ <b>Blank GW</b> — "
+                "blanking players contribute 0 to the simulation</div>",
                 unsafe_allow_html=True,
             )
         cap_name = res.get("target_captain", "—")
         cap_ppg  = res.get("target_captain_ppg", 0)
-        cap_sig  = res.get("target_sigma", 8) * 2
+        win_se   = res.get("win_prob_se", 0)
         st.markdown(
             f"<div style='background:#1a1a2e;border:1px solid #ffd60033;"
             f"border-radius:10px;padding:8px 14px;margin-bottom:8px;font-size:13px'>"
             f"<span style='color:#ffd600'>★ Captain: <b>{cap_name}</b></span> "
             f"&nbsp;·&nbsp; PPG {cap_ppg:.2f} "
-            f"&nbsp;·&nbsp; σ = {cap_sig:.0f} pts"
+            f"&nbsp;·&nbsp; Win Prob SE ±{win_se:.2f}%"
             f"</div>", unsafe_allow_html=True
         )
         st.markdown(
@@ -424,7 +454,7 @@ with col_assassin:
             for _, row in buy_targets.iterrows():
                 st.markdown(
                     f"<div class='assassin-row'>🔴 <b>{row['web_name']}</b> "
-                    f"– xGA {row['xGA']:.2f} | {row['ownership_pct']:.1f}% owned | "
+                    f"– xGI {row['xGI']:.2f} | {row['ownership_pct']:.1f}% owned | "
                     f"{int(row['rival_ownership_count'])} rivals</div>",
                     unsafe_allow_html=True,
                 )
@@ -439,7 +469,8 @@ with col_presser:
             st.markdown(
                 "<div style='background:#ff174422;border:1px solid #ff1744;"
                 "border-radius:8px;padding:6px 12px;margin-bottom:8px;"
-                "color:#ff6e6e;font-size:13px'>⚠️ <b>Heuristic mode</b> — السيستم مهنج شوية</div>",
+                "color:#ff6e6e;font-size:13px'>⚠️ <b>Heuristic estimate</b> — "
+                "AI analysis unavailable. Check your API key or connection.</div>",
                 unsafe_allow_html=True,
             )
         likelihood = pr.get("start_likelihood", "?")
@@ -488,7 +519,7 @@ with col_presser:
 st.markdown("---")
 st.markdown("### Transfer Lab — What-If Simulator")
 
-pdf             = st.session_state.players_df
+pdf             = _valid_df("players_df", ("id", "ppg", "xGI", "element_type", "ownership_pct"))
 target_profile  = st.session_state.target_profile
 leader_profile  = st.session_state.leader_profile
 sim_cfg         = st.session_state.sim_cfg
@@ -503,11 +534,23 @@ else:
         lambda r: f"{r['web_name']} ({POSITION_LABELS.get(r['element_type'], '?')}) — {r['ppg']} PPG", axis=1
     )
 
-    inertia_threshold = st.slider(
-        "Inertia threshold (min xP gain to avoid 'Lateral Move')",
-        min_value=0.0, max_value=5.0, value=0.7, step=0.1,
-        key="inertia_slider",
-    )
+    with st.expander("⚙️ Advanced Settings"):
+        inertia_threshold = st.slider(
+            "Minimum points gain to count as a real upgrade",
+            min_value=0.0, max_value=5.0, value=1.0, step=0.1,
+            key="inertia_slider",
+            help=(
+                "Transfers below this threshold are labelled 'Lateral Move' — "
+                "not worth burning a free transfer or taking a hit. "
+                "This is a judgment call, not a calibrated constant: "
+                "tune it to match how much of a PPG edge you personally require "
+                "before pulling the trigger on a transfer."
+            ),
+        )
+        st.caption(
+            "⚠️ This threshold is not calibrated against the per-player simulation model. "
+            "Start at 1.0 and adjust: lower it if you transfer freely, raise it if you prefer stability."
+        )
 
     lab_col1, lab_col2, lab_col3 = st.columns([1.4, 1.4, 1.2])
 
@@ -527,7 +570,7 @@ else:
         st.markdown(
             f"<div class='metric-card' style='margin-top:8px'>"
             f"<b>{out_row['web_name']}</b><br>"
-            f"PPG: {out_ppg_val:.2f} &nbsp;|&nbsp; xGA: {out_row.get('xGA', 0):.2f}<br>"
+            f"PPG: {out_ppg_val:.2f} &nbsp;|&nbsp; xGI: {out_row.get('xGI', 0):.2f}<br>"
             f"Pos: {POSITION_LABELS.get(out_pos, '?')} &nbsp;|&nbsp; Own: {out_row['ownership_pct']:.1f}%"
             f"</div>", unsafe_allow_html=True
         )
@@ -537,10 +580,10 @@ else:
         non_squad_df = pdf[
             (~pdf["id"].isin(target_profile.squad_player_ids)) &
             (pdf["element_type"] == out_pos)
-        ].copy().sort_values("xGA", ascending=False)
+        ].copy().sort_values("xGI", ascending=False)
 
         non_squad_df["label"] = non_squad_df.apply(
-            lambda r: f"{r['web_name']} ({r['short_name']}) — {r['ppg']} PPG | xGA {r['xGA']:.2f}", axis=1
+            lambda r: f"{r['web_name']} ({r['short_name']}) — {r['ppg']} PPG | xGI {r['xGI']:.2f}", axis=1
         )
 
         in_label = st.selectbox(
@@ -556,7 +599,7 @@ else:
         st.markdown(
             f"<div class='metric-card' style='margin-top:8px'>"
             f"<b>{in_row['web_name']}</b><br>"
-            f"PPG: {in_ppg_val:.2f} &nbsp;|&nbsp; xGA: {in_row.get('xGA', 0):.2f}<br>"
+            f"PPG: {in_ppg_val:.2f} &nbsp;|&nbsp; xGI: {in_row.get('xGI', 0):.2f}<br>"
             f"Pos: {POSITION_LABELS.get(out_pos, '?')} &nbsp;|&nbsp; Own: {in_row['ownership_pct']:.1f}%"
             f"</div>", unsafe_allow_html=True
         )
@@ -584,17 +627,34 @@ else:
             v_color = {
                 "MAKE IT":      "#00e676",
                 "WORTH IT":     "#69f0ae",
+                "INCONCLUSIVE": "#78909c",
                 "HOLD":         "#ff9800",
                 "AVOID":        "#ff1744",
-                "LATERAL MOVE": "#78909c",
+                "LATERAL MOVE": "#546e7a",
             }.get(verdict, "#e0e0e0")
+
+            noise_floor = tr.get("noise_floor", 0)
+            win_se      = tr.get("win_prob_se", 0)
+
+            cap_note = ""
+            if tr.get("captain_promoted") and tr.get("promoted_captain"):
+                cap_note = (
+                    f"<div style='margin-top:8px;padding:6px 8px;"
+                    f"background:#ffd60022;border:1px solid #ffd600;"
+                    f"border-radius:6px;font-size:11px;color:#ffd600;text-align:left'>"
+                    f"★ Captain auto-promoted to <b>{tr['promoted_captain']}</b> "
+                    f"(transferred out your previous captain)"
+                    f"</div>"
+                )
 
             st.markdown(
                 f"<div class='metric-card'>"
                 f"<h2 style='color:{v_color};margin:0'>{verdict}</h2>"
                 f"<span style='font-size:2rem;color:{v_color}'>"
                 f"{'▲' if delta > 0 else '▼' if delta < 0 else '►'} {abs(delta):.1f}%</span><br>"
-                f"<span style='color:#b0bec5;font-size:12px'>Win probability delta</span>"
+                f"<span style='color:#b0bec5;font-size:12px'>Win Δ &nbsp;·&nbsp; "
+                f"SE ±{win_se:.2f}% &nbsp;·&nbsp; noise floor {noise_floor:.2f}%</span>"
+                f"{cap_note}"
                 f"</div>", unsafe_allow_html=True
             )
 
@@ -665,7 +725,7 @@ else:
                 fig_xp.add_hline(
                     y=inertia_threshold,
                     line_dash="dash", line_color="#ff9800",
-                    annotation_text=f"Inertia ({inertia_threshold:.1f})",
+                    annotation_text=f"Your threshold ({inertia_threshold:.1f} pts — adjust in Advanced Settings)",
                     annotation_position="top right",
                 )
                 fig_xp.update_layout(
@@ -677,9 +737,9 @@ else:
                 )
                 st.plotly_chart(fig_xp, use_container_width=True)
 
-            # PPG + xGA impact strip
+            # PPG + xGI impact strip
             ppg_d = tr["ppg_delta"]
-            xga_d = round(tr["in_xga"] - tr["out_xga"], 2)
+            xgi_d = round(tr["in_xgi"] - tr["out_xgi"], 2)
             st.markdown(
                 f"<div style='display:flex;gap:12px;margin-top:4px'>"
                 f"<div class='metric-card' style='flex:1'>"
@@ -687,9 +747,9 @@ else:
                 f"<span style='color:{'#00e676' if ppg_d > 0 else '#ff1744'};font-size:1.3rem'>"
                 f"{'▲' if ppg_d > 0 else '▼'} {abs(ppg_d):.2f}</span></div>"
                 f"<div class='metric-card' style='flex:1'>"
-                f"<b>xGA shift</b><br>"
-                f"<span style='color:{'#00e676' if xga_d > 0 else '#ff1744'};font-size:1.3rem'>"
-                f"{'▲' if xga_d > 0 else '▼'} {abs(xga_d):.2f}</span></div>"
+                f"<b>xGI shift</b><br>"
+                f"<span style='color:{'#00e676' if xgi_d > 0 else '#ff1744'};font-size:1.3rem'>"
+                f"{'▲' if xgi_d > 0 else '▼'} {abs(xgi_d):.2f}</span></div>"
                 f"<div class='metric-card' style='flex:1'>"
                 f"<b>Gap Δ</b><br>"
                 f"<span style='color:{'#00e676' if tr['gap_delta'] < 0 else '#ff1744'};font-size:1.3rem'>"
@@ -697,118 +757,12 @@ else:
                 f"</div>", unsafe_allow_html=True
             )
 
-# ---------------------------------------------------------------------------
-# Content Creator Mode — 60-second Ammiya video script generator
-# ---------------------------------------------------------------------------
 st.markdown("---")
-st.markdown("### Content Creator Mode — Auto Script Generator")
-
-sim_res   = st.session_state.sim_results
-assassins = st.session_state.assassins
-gw_info   = st.session_state.gw_info
-tr_result = st.session_state.transfer_result
-
-if sim_res is None:
-    st.info("Run CLUTCH first to unlock the Script Generator.")
-else:
-    script_col, preview_col = st.columns([1, 1.6])
-
-    with script_col:
-        st.markdown("**What goes in**")
-        st.markdown(
-            f"<div class='metric-card' style='font-size:13px;text-align:left'>"
-            f"✅ Win Probability: <b>{sim_res['win_probability']}%</b><br>"
-            f"✅ Gap vs {sim_res['leader_name']}: <b>{sim_res['current_gap']} pts</b><br>"
-            f"✅ Assassin candidates: <b>{'Yes' if assassins is not None and not assassins.empty else 'No'}</b><br>"
-            f"✅ Transfer tip: <b>{'Yes — ' + tr_result['player_out'] + ' → ' + tr_result['player_in'] if tr_result else 'None'}</b><br>"
-            f"✅ GW Type: <b>{'DGW' if gw_info and gw_info.get('is_dgw') else 'BGW' if gw_info and gw_info.get('is_bgw') else 'Normal'}</b>"
-            f"</div>", unsafe_allow_html=True
-        )
-        st.markdown("")
-        script_api_key = _resolve_api_key()
-
-        cc_tab_script, cc_tab_caption = st.tabs(["🎬 Video Script", "📱 Social Caption"])
-
-        with cc_tab_script:
-            gen_btn = st.button("Generate 60-Second Script", use_container_width=True, key="gen_script")
-            if gen_btn:
-                with st.spinner("CLUTCH is writing your script..."):
-                    script_text = nlp_utils.generate_video_script(
-                        sim_result=sim_res,
-                        assassins_df=assassins,
-                        manager_name=sim_res.get("target_name", "Manager"),
-                        gw_context=gw_info,
-                        transfer_result=tr_result,
-                        api_key=script_api_key or None,
-                    )
-                    st.session_state["video_script"] = script_text
-
-        with cc_tab_caption:
-            platform = st.selectbox(
-                "Platform", ["instagram", "tiktok", "twitter"], key="caption_platform"
-            )
-            cap_btn = st.button("Generate Social Caption", use_container_width=True, key="gen_caption")
-            if cap_btn:
-                with st.spinner("Crafting your carousel caption..."):
-                    caption_text = nlp_utils.generate_social_caption(
-                        sim_result=sim_res,
-                        assassins_df=assassins,
-                        gw_context=gw_info,
-                        transfer_result=tr_result,
-                        platform=platform,
-                        api_key=script_api_key or None,
-                    )
-                    st.session_state["social_caption"] = caption_text
-
-    with preview_col:
-        st.markdown("**Generated Script**")
-        script_text = st.session_state.get("video_script")
-        if script_text:
-            word_count = len(script_text.split())
-            read_secs  = max(30, min(90, int(word_count / 2.5)))
-            st.markdown(
-                f"<div style='background:#111122;border:1px solid #00e5ff33;border-radius:12px;"
-                f"padding:16px 20px;font-size:15px;line-height:1.8;direction:rtl;text-align:right;"
-                f"font-family:Georgia,serif;color:#e8e8e8'>{script_text}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div style='color:#555;font-size:12px;margin-top:6px'>"
-                f"~{word_count} words &nbsp;·&nbsp; ~{read_secs}s read time</div>",
-                unsafe_allow_html=True,
-            )
-            st.text_area(
-                "Copy-paste version",
-                value=script_text,
-                height=160,
-                key="script_copy_box",
-                label_visibility="collapsed",
-            )
-        else:
-            st.info("Click **Generate Script** to create your Ammiya video script.")
-
-        # Social caption preview (shown in preview column regardless of active tab)
-        caption_text = st.session_state.get("social_caption")
-        if caption_text:
-            st.markdown("---")
-            st.markdown("**Social Caption Preview**")
-            slides = [s.strip() for s in caption_text.split("---") if s.strip()]
-            for i, slide in enumerate(slides, 1):
-                # Detect if slide contains Arabic (RTL) vs hashtag-only (LTR)
-                has_arabic = any("؀" <= c <= "ۿ" for c in slide)
-                direction  = "rtl" if has_arabic else "ltr"
-                st.markdown(
-                    f"<div style='background:#1a1a2e;border:1px solid #00e5ff22;"
-                    f"border-radius:8px;padding:10px 14px;margin-bottom:6px;"
-                    f"direction:{direction};font-size:14px;line-height:1.7'>"
-                    f"<span style='color:#555;font-size:11px'>Slide {i}</span><br>"
-                    f"{slide}</div>",
-                    unsafe_allow_html=True,
-                )
-            st.text_area(
-                "Copy all slides",
-                value=caption_text,
-                height=120,
-                key="caption_copy_box",
-                label_visibility="collapsed",
-            )
+st.markdown(
+    "<div style='background:#1a1a2e;border:1px solid #00e5ff33;border-radius:12px;"
+    "padding:14px 20px;font-size:14px'>"
+    "🎬 <b>Content Creator?</b> &nbsp; Open <b>Content Creator</b> in the sidebar "
+    "to generate Egyptian Arabic YouTube scripts and social captions from your CLUTCH data."
+    "</div>",
+    unsafe_allow_html=True,
+)

@@ -1,6 +1,6 @@
 """
 CLUTCH – The Coach-Speak Interpreter
-Analyzes press conference quotes via Groq API (llama-3.3-70b).
+Analyzes press conference quotes via OpenRouter (meta-llama/llama-3.3-70b-instruct).
 Returns start likelihood (0-100) and a personalized impact summary
 cross-referenced against the manager's actual squad.
 """
@@ -8,11 +8,16 @@ cross-referenced against the manager's actual squad.
 import os
 import json
 import re
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from typing import Optional
 from openai import OpenAI
 
-# OpenRouter endpoint + model slug for Llama 3.3 70B via Groq backend
+log = logging.getLogger(__name__)
+
+# OpenRouter endpoint — uses OpenAI-compatible SDK, NOT the Groq SDK.
+# Latency and cost profile differ from direct Groq API.
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 MODEL = "meta-llama/llama-3.3-70b-instruct"
 
@@ -105,15 +110,16 @@ def _ammiya_fallback(
     reason: str = "api_error",
 ) -> dict:
     """Egyptian Arabic heuristic fallback when the LLM call fails."""
+    log.warning("nlp_utils fallback triggered: manager=%s player=%s reason=%s", manager_id, player_name, reason)
     squad_note = "وانت شايله" if in_squad else "مش في الفريق بتاعك"
     return {
         "start_likelihood": 50,
         "confidence": "Low",
-        "key_signals": ["السيستم مش قادر يحلل دلوقتي"],
-        "risk_flags": [f"fallback_reason={reason}"],
+        "key_signals": ["التحليل مش متاح دلوقتي — الأرقام بس اللي عندنا"],
+        "risk_flags": ["تحقق من الاتصال أو الـ API key"],
         "impact_summary": (
-            f"السيستم مهنج شوية، بس غالباً اللعيب ده هيلعب أساسي — {player_name} {squad_note}. "
-            "متعملش قرار كبير دلوقتي وإنت مش عارف الوضع."
+            f"التحليل الآلي مش شغال دلوقتي — {player_name} {squad_note}. "
+            "متعملش قرار كبير من غير تحليل كامل."
         ),
         "transfer_action": "Monitor",
         "manager_id": manager_id,
@@ -207,7 +213,8 @@ def generate_video_script(
     """
     key = api_key or os.getenv("OPENROUTER_API_KEY", "")
 
-    win_prob_raw = sim_result.get("win_probability", 0)
+    _raw         = sim_result.get("win_probability", 0)
+    win_prob_raw: float | None = float(_raw) if isinstance(_raw, (int, float)) else None
     leader_name  = sim_result.get("leader_name", "المتصدر")
     gap          = sim_result.get("current_gap", "?")
     gw           = gw_context.get("gw", "?") if gw_context else "?"
@@ -217,10 +224,15 @@ def generate_video_script(
         else "جيم ويك عادية"
     )
 
-    # ── Fix 1: Hope Filter ────────────────────────────────────────────────────
-    # Never open a script with a demoralising probability number.
+    # ── Hope Filter ───────────────────────────────────────────────────────────
+    # win_prob_raw is None when the sim result was malformed — treat as unknown.
     # Under 5% → swap the stat for a motivational frame.
-    if isinstance(win_prob_raw, (int, float)) and win_prob_raw < 5:
+    if win_prob_raw is None:
+        prob_line = (
+            "الـ CLUTCH Engine شغّال — بس البيانات مش مكتملة دلوقتي."
+        )
+        prob_instruction = "لا تذكر نسبة احتمالية الفوز — البيانات مش متاحة."
+    elif win_prob_raw < 5:
         prob_line = (
             "المهمة صعبة والفرق كبير، "
             "بس الـ Assassin Engine لسه مطلع لنا ثغرات نقدر نلعب عليها!"
@@ -230,7 +242,7 @@ def generate_video_script(
             f'"{prob_line}"'
         )
     else:
-        prob_line        = f"احتمالية الفوز على {leader_name}: {win_prob_raw}%"
+        prob_line        = f"احتمالية الفوز على {leader_name}: {win_prob_raw:.1f}%"
         prob_instruction = "اذكر احتمالية الفوز بشكل دراماتيكي مع اسم المنافس."
 
     # ── Fix 2: Clutch Gain Pivot ─────────────────────────────────────────────
@@ -258,7 +270,7 @@ def generate_video_script(
         for _, row in top3.iterrows():
             bgw_note = " (بلانك — ابعد عنه!)" if row.get("has_bgw") else ""
             assassin_lines += (
-                f"- {row['web_name']}{bgw_note}: xGA {row.get('xGA', 0):.2f}, "
+                f"- {row['web_name']}{bgw_note}: xGI {row.get('xGI', 0):.2f}, "
                 f"ملكيته {row['ownership_pct']:.1f}%, "
                 f"بس {int(row.get('rival_ownership_count', 0))} من منافسيك شايلينه\n"
             )
@@ -277,11 +289,11 @@ def generate_video_script(
 قواعد الكتابة (لازم تتبعها):
 1. ابدأ بجملة hook مباشرة — مفيش "أهلاً" أو "يا جماعة" في الأول
 2. {prob_instruction}
-3. اذكر اسم اللاعب الـ Assassin بثقة + رقم xGA بتاعه
+3. اذكر اسم اللاعب الـ Assassin بثقة + رقم xGI بتاعه
 4. {f'استخدم جملة الـ Clutch Gain بالحرف.' if transfer_result else 'مفيش تحويلة — ركز على الـ Assassin.'}
 5. اختم بـ CTA طبيعي مش رسمي — زي كلام صاحبك مش إعلان
 6. الأسلوب: جمل قصيرة. مفيش فقرات طويلة. حوار مش خطبة.
-7. مفيش ترجمة حرفية للإنجليزي — قول "الـ xGA" مش "المتوقع من الأهداف والتمريرات"
+7. مفيش ترجمة حرفية للإنجليزي — قول "الـ xGI" مش "المتوقع من الأهداف والتمريرات"
 8. الطول: 130-160 كلمة بالضبط
 
 اكتب السكريبت فقط — بدون عناوين أو تعليقات."""
@@ -294,7 +306,7 @@ def generate_video_script(
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.82,
+            temperature=0.8,   # feel-based; not ablation-tested vs 0.7/0.9
             max_tokens=450,
             extra_headers={"HTTP-Referer": "https://clutch-fpl.app", "X-Title": "CLUTCH FPL"},
         )
@@ -351,7 +363,7 @@ def generate_social_caption(
         top = assassins_df[~assassins_df.get("target_owns", pd.Series(True, index=assassins_df.index))].head(1)
         if not top.empty:
             r = top.iloc[0]
-            top_assassin = f"{r['web_name']} (xGA {r.get('xGA', 0):.2f}, ملكية {r['ownership_pct']:.1f}%)"
+            top_assassin = f"{r['web_name']} (xGI {r.get('xGI', 0):.2f}, ملكية {r['ownership_pct']:.1f}%)"
 
     if transfer_result:
         xp_gain = f"+{transfer_result['total_xp_gain']:.1f} نقطة خام على الـ 5 جيم ويكس الجايين"
@@ -427,22 +439,30 @@ def batch_interpret(
     players_df: Optional[pd.DataFrame] = None,
     gw_context: Optional[dict] = None,
     api_key: Optional[str] = None,
+    max_workers: int = 4,
 ) -> list[dict]:
     """
-    Process multiple presser quotes in sequence.
+    Interpret multiple presser quotes in parallel (ThreadPoolExecutor).
     Each item in quotes: {"quote": str, "player_name": str, "player_id": int|None}
+    Results are returned in the same order as the input list.
     """
-    results = []
-    for item in quotes:
-        res = interpret_presser(
-            quote=item["quote"],
+    def _call(item: dict) -> tuple[int, dict]:
+        idx, q = item
+        return idx, interpret_presser(
+            quote=q["quote"],
             manager_id=manager_id,
-            player_name=item["player_name"],
+            player_name=q["player_name"],
             squad_player_ids=squad_player_ids,
-            player_id=item.get("player_id"),
+            player_id=q.get("player_id"),
             players_df=players_df,
             gw_context=gw_context,
             api_key=api_key,
         )
-        results.append(res)
-    return results
+
+    ordered: list[dict] = [{}] * len(quotes)
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(quotes) or 1)) as pool:
+        futures = [pool.submit(_call, (i, q)) for i, q in enumerate(quotes)]
+        for fut in as_completed(futures):
+            idx, result = fut.result()
+            ordered[idx] = result
+    return ordered

@@ -1,20 +1,60 @@
 """
 CLUTCH – The Overtake Handler
 Fetches FPL bootstrap data, manager squad, and mini-league standings.
-Computes ownership gap (Assassin candidates) for a target manager.
+
+Fixes vs v1:
+  - _get() uses a persistent Session with urllib3 Retry (3 attempts,
+    exponential backoff, retries on 429/5xx). No more crash on transient 503.
+  - compute_ownership_gap accepts bootstrap/players_df from the caller
+    instead of re-fetching bootstrap on every run.
+  - xG+xA column renamed xGI (expected Goal Involvement). xGA is a
+    defensive metric (expected Goals Against) — wrong name for an
+    attacking proxy.
+  - get_players_df fills missing expected_goals/expected_assists with 0
+    and warns, instead of silently substituting ppg.
 """
 
+import logging
+import warnings
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import pandas as pd
 from datetime import datetime, timezone
 from typing import Optional
 
-BASE = "https://fantasy.premierleague.com/api"
+log = logging.getLogger(__name__)
+
+BASE    = "https://fantasy.premierleague.com/api"
 HEADERS = {"User-Agent": "CLUTCH-FPL-Engine/1.0"}
 
 
+# ---------------------------------------------------------------------------
+# HTTP layer — persistent session with exponential backoff
+# ---------------------------------------------------------------------------
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    retry   = Retry(
+        total=3,
+        backoff_factor=1,                          # sleeps: 1s, 2s, 4s
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET"},
+        raise_on_status=False,                     # let raise_for_status handle it
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+    return session
+
+
+_SESSION = _make_session()
+
+
 def _get(url: str) -> dict:
-    r = requests.get(url, headers=HEADERS, timeout=15)
+    r = _SESSION.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -29,10 +69,8 @@ def get_bootstrap() -> dict:
 
 def get_gw_info(gw: int, bootstrap: Optional[dict] = None) -> dict:
     """
-    Returns timing and type context for a given gameweek:
-      - deadline_iso, deadline_human, minutes_to_deadline
-      - is_dgw (Double GW), is_bgw (Blank GW)
-    DGW/BGW are inferred from the fixtures endpoint — no FPL field is reliable.
+    Returns timing and type context for a given gameweek.
+    Accepts an already-fetched bootstrap dict to avoid a redundant API call.
     """
     bs     = bootstrap or get_bootstrap()
     events = {e["id"]: e for e in bs.get("events", [])}
@@ -43,14 +81,13 @@ def get_gw_info(gw: int, bootstrap: Optional[dict] = None) -> dict:
     minutes_left   = None
 
     if deadline_iso:
-        dt = datetime.fromisoformat(deadline_iso.replace("Z", "+00:00"))
+        dt             = datetime.fromisoformat(deadline_iso.replace("Z", "+00:00"))
         deadline_human = dt.strftime("%a %d %b, %H:%M UTC")
-        delta = dt - datetime.now(timezone.utc)
-        minutes_left = max(0, int(delta.total_seconds() // 60))
+        delta          = dt - datetime.now(timezone.utc)
+        minutes_left   = max(0, int(delta.total_seconds() // 60))
 
-    # Infer DGW/BGW from fixtures for this event
     try:
-        fixtures = _get(f"{BASE}/fixtures/?event={gw}")
+        fixtures    = _get(f"{BASE}/fixtures/?event={gw}")
         team_counts: dict[int, int] = {}
         for f in fixtures:
             for t in (f["team_h"], f["team_a"]):
@@ -58,35 +95,70 @@ def get_gw_info(gw: int, bootstrap: Optional[dict] = None) -> dict:
         all_teams = {t["id"] for t in bs.get("teams", [])}
         dgw_teams = {t for t, c in team_counts.items() if c > 1}
         bgw_teams = all_teams - set(team_counts.keys())
-        is_dgw = len(dgw_teams) > 0
-        is_bgw = len(bgw_teams) > 0
+        is_dgw    = len(dgw_teams) > 0
+        is_bgw    = len(bgw_teams) > 0
     except Exception:
         is_dgw = is_bgw = False
         dgw_teams = bgw_teams = set()
 
     return {
-        "gw":              gw,
-        "deadline_iso":    deadline_iso,
-        "deadline_human":  deadline_human,
+        "gw":                  gw,
+        "deadline_iso":        deadline_iso,
+        "deadline_human":      deadline_human,
         "minutes_to_deadline": minutes_left,
-        "is_dgw":          is_dgw,
-        "is_bgw":          is_bgw,
-        "dgw_teams":       dgw_teams,
-        "bgw_teams":       bgw_teams,
-        "finished":        event.get("finished", False),
+        "is_dgw":              is_dgw,
+        "is_bgw":              is_bgw,
+        "dgw_teams":           dgw_teams,
+        "bgw_teams":           bgw_teams,
+        "finished":            event.get("finished", False),
     }
 
 
 def get_players_df(bootstrap: Optional[dict] = None) -> pd.DataFrame:
-    bs = bootstrap or get_bootstrap()
+    """
+    Build the master players DataFrame from bootstrap data.
+
+    xGI (expected Goal Involvement) = xG + xA — an attacking proxy for
+    FPL differential analysis. Not to be confused with xGA (expected
+    Goals Against), which is a defensive metric.
+
+    Missing stat fields are filled with 0 and a warning is emitted,
+    rather than silently substituting an unrelated column (ppg).
+    """
+    bs      = bootstrap or get_bootstrap()
     players = pd.DataFrame(bs["elements"])
     teams   = pd.DataFrame(bs["teams"])[["id", "name", "short_name"]]
     players = players.merge(teams, left_on="team", right_on="id", suffixes=("", "_team"))
+
     players["ownership_pct"] = players["selected_by_percent"].astype(float)
-    players["ppg"] = players["points_per_game"].astype(float)
-    players["xG"]  = pd.to_numeric(players.get("expected_goals", players["ppg"]), errors="coerce").fillna(0)
-    players["xA"]  = pd.to_numeric(players.get("expected_assists", 0), errors="coerce").fillna(0)
-    players["xGA"] = players["xG"] + players["xA"]
+    players["ppg"]           = players["points_per_game"].astype(float)
+
+    # xG — warn and fill 0 if column absent (API may not expose it yet)
+    if "expected_goals" in players.columns:
+        players["xG"] = pd.to_numeric(players["expected_goals"], errors="coerce").fillna(0)
+    else:
+        warnings.warn(
+            "FPL API did not return 'expected_goals'; xG set to 0 for all players.",
+            RuntimeWarning, stacklevel=2,
+        )
+        players["xG"] = 0.0
+
+    # xA — same treatment
+    if "expected_assists" in players.columns:
+        players["xA"] = pd.to_numeric(players["expected_assists"], errors="coerce").fillna(0)
+    else:
+        warnings.warn(
+            "FPL API did not return 'expected_assists'; xA set to 0 for all players.",
+            RuntimeWarning, stacklevel=2,
+        )
+        players["xA"] = 0.0
+
+    # xGI = expected Goal Involvement (xG + xA) — attacking FPL proxy
+    players["xGI"] = players["xG"] + players["xA"]
+
+    # form as float for simulator sigma calculation
+    players["form"] = pd.to_numeric(players.get("form", 0), errors="coerce").fillna(0)
+
     return players
 
 
@@ -113,8 +185,7 @@ def get_mini_league_standings(league_id: int, page: int = 1) -> dict:
 
 def get_top_n_managers(league_id: int, n: int = 5) -> list[dict]:
     standings = get_mini_league_standings(league_id)
-    results   = standings["standings"]["results"]
-    return results[:n]
+    return standings["standings"]["results"][:n]
 
 
 def get_rival_player_ids(
@@ -132,47 +203,53 @@ def compute_ownership_gap(
     league_id: int,
     gameweek: int,
     players_df: Optional[pd.DataFrame] = None,
+    bootstrap: Optional[dict] = None,
     low_ownership_threshold: float = 15.0,
-    xga_threshold: float = 0.3,
+    xgi_threshold: float = 0.3,
     bgw_teams: Optional[set] = None,
+    top5_standings: Optional[list] = None,
+    target_picks: Optional[list] = None,
+    rival_picks: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
-    Returns players owned by the target but NOT by most rivals,
-    filtered for high xG+xA and low overall ownership –
-    i.e. the 'Assassin' differential opportunities.
+    Returns Assassin differential candidates: players with low global
+    ownership and high xGI (xG+xA) that rivals are not holding.
+
+    Pass top5_standings, target_picks, and rival_picks from the caller to
+    avoid redundant network requests — all three are already fetched by the
+    main run block and can be forwarded here at zero cost.
     """
-    bs = get_bootstrap()
+    bs = bootstrap or get_bootstrap()
     df = players_df if players_df is not None else get_players_df(bs)
 
-    top5        = get_top_n_managers(league_id, n=5)
+    top5        = top5_standings or get_top_n_managers(league_id, n=5)
     rival_ids   = [m["entry"] for m in top5 if m["entry"] != target_id]
-    target_owns = set(get_manager_picks(target_id, gameweek))
-    rival_owns  = get_rival_player_ids(rival_ids, gameweek)
+    target_owns = set(target_picks) if target_picks is not None else set(get_manager_picks(target_id, gameweek))
+    rival_owns  = rival_picks if rival_picks is not None else get_rival_player_ids(rival_ids, gameweek)
 
-    # Count how many rivals own each player
     rival_counts: dict[int, int] = {}
     for picks in rival_owns.values():
         for pid in picks:
             rival_counts[pid] = rival_counts.get(pid, 0) + 1
 
-    # Assassin: low global ownership, high xGA, not widely held by rivals
     assassins = df[
         (df["ownership_pct"] < low_ownership_threshold)
-        & (df["xGA"] >= xga_threshold)
+        & (df["xGI"] >= xgi_threshold)
     ].copy()
 
-    assassins["rival_ownership_count"] = assassins["id"].map(rival_counts).fillna(0).astype(int)
+    assassins["rival_ownership_count"] = (
+        assassins["id"].map(rival_counts).fillna(0).astype(int)
+    )
     assassins["target_owns"] = assassins["id"].isin(target_owns)
+    assassins["has_bgw"]     = (
+        assassins["team"].isin(bgw_teams) if bgw_teams else False
+    )
 
-    # Flag players whose team has no fixture this GW (Blank GW)
-    if bgw_teams:
-        assassins["has_bgw"] = assassins["team"].isin(bgw_teams)
-    else:
-        assassins["has_bgw"] = False
+    assassins = assassins.sort_values("xGI", ascending=False)
 
-    assassins = assassins.sort_values("xGA", ascending=False)
-
-    cols = ["id", "web_name", "short_name", "element_type",
-            "ownership_pct", "xG", "xA", "xGA",
-            "rival_ownership_count", "target_owns", "ppg", "has_bgw", "team"]
+    cols = [
+        "id", "web_name", "short_name", "element_type",
+        "ownership_pct", "xG", "xA", "xGI",
+        "rival_ownership_count", "target_owns", "ppg", "has_bgw", "team",
+    ]
     return assassins[[c for c in cols if c in assassins.columns]].reset_index(drop=True)
