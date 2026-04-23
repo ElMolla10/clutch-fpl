@@ -107,6 +107,8 @@ pip install -r requirements.txt
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 # edit secrets.toml and add your OpenRouter key
 streamlit run app.py
+# Note: the first run fetches fixture results for every finished GW to build
+# elo_ratings.json — this takes a few extra seconds. Subsequent runs are instant.
 ```
 
 ### Streamlit Cloud
@@ -195,6 +197,8 @@ Open via the sidebar navigation. Requires the main simulation to have been run f
 **Sigma ceiling** — `_player_sigma` caps at `max(ppg × 0.8, base × 1.5)`. Without this, a player returning from injury with low season PPG and high recent form can produce sigma > 10, which regularly samples negative or 30+ point gameweeks from a Normal distribution — physically impossible in FPL.
 
 **Fixture-adjusted expected points** — `get_team_fixture_weights` fetches FDR (Fixture Difficulty Rating 1–5) for each upcoming GW and maps them to score multipliers (1.20 / 1.10 / 1.00 / 0.88 / 0.75). Every player in the simulation is scaled by their own team's schedule, not a global weight. A player with a great run of fixtures scores higher expected points in those GWs; a player blanking (0.0) or facing a tough run is penalised accordingly. `simulate_transfer` uses each player's own team fixture weights when computing xP gain per GW — so "bring in X" correctly reflects X's upcoming schedule vs the player going out.
+
+**Elo ratings replace FDR when available** — `elo.py` replays every completed fixture from GW1 using a standard Elo formula (K=20, initial rating 1500 for all teams) and persists the result to `elo_ratings.json`. On subsequent runs, only new gameweeks are fetched — a delta update that makes zero API calls when already current. When ratings are available, `get_team_fixture_weights` replaces FDR tiers with a continuous win-probability weight: `0.75 + win_prob × 0.45`, ranging from 0.75 (near-certain loss) to 1.20 (near-certain win). FDR is a human-curated ordinal; Elo is derived directly from match results, so it adjusts automatically as team form changes across the season.
 
 **Bilingual error handling** — the Presser Intel fallback responds in Egyptian Arabic, consistent with the tool's target audience. Internal error state (reason codes, exception details) goes to `logging.warning`, not to the UI.
 
