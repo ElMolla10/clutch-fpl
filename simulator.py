@@ -319,6 +319,15 @@ def simulate_transfer(
         float((l_final - t_mod_final).mean()) - float((l_final - t_base_final).mean()), 1
     )
 
+    def _prow(pid):
+        rows = players_df[players_df["id"] == pid]
+        return rows.iloc[0] if not rows.empty else pd.Series(
+            {"web_name": str(pid), "ppg": 0.0, "xGI": 0.0, "ownership_pct": 0.0}
+        )
+
+    out_row = _prow(player_out_id)
+    in_row  = _prow(player_in_id)
+
     # xP gain per GW — fixture-adjusted: each player scaled by their own team's
     # FDR multiplier rather than a shared global weight.
     def _team_fw(row: pd.Series) -> np.ndarray:
@@ -355,15 +364,6 @@ def simulate_transfer(
         verdict = "AVOID"
     else:
         verdict = "HOLD"
-
-    def _prow(pid):
-        rows = players_df[players_df["id"] == pid]
-        return rows.iloc[0] if not rows.empty else pd.Series(
-            {"web_name": str(pid), "ppg": 0.0, "xGI": 0.0, "ownership_pct": 0.0}
-        )
-
-    out_row = _prow(player_out_id)
-    in_row  = _prow(player_in_id)
 
     return {
         "player_out":          str(out_row["web_name"]),

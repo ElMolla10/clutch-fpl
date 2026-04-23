@@ -24,12 +24,17 @@ def _resolve_api_key() -> str:
 
 
 @st.cache_data(ttl=300)
-def _fetch_fpl_data(gw: int) -> tuple[dict, pd.DataFrame, dict]:
-    """Fetch bootstrap once per 5-minute window; derive players_df and gw_info from it."""
+def _fetch_fpl_data(gw: int) -> tuple[dict, pd.DataFrame, dict, dict]:
+    """Fetch bootstrap once per 5-minute window; derive players_df, gw_info, and Elo ratings."""
+    from elo import build_season_ratings
     bs      = fpl_api.get_bootstrap()
     pdf     = fpl_api.get_players_df(bs)
     gw_info = fpl_api.get_gw_info(gw, bs)
-    return bs, pdf, gw_info
+    try:
+        elo_ratings = build_season_ratings(bootstrap=bs)
+    except Exception:
+        elo_ratings = {}
+    return bs, pdf, gw_info, elo_ratings
 
 
 @st.cache_data(ttl=300)
@@ -43,8 +48,8 @@ def _fetch_picks(manager_id: int, gw: int) -> list[int]:
 
 
 @st.cache_data(ttl=300)
-def _fetch_fixture_weights(gw: int, n_gws: int) -> dict:
-    return fpl_api.get_team_fixture_weights(gw, n_gws)
+def _fetch_fixture_weights(gw: int, n_gws: int, elo_ratings: dict | None = None) -> dict:
+    return fpl_api.get_team_fixture_weights(gw, n_gws, elo_ratings=elo_ratings or None)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -275,7 +280,7 @@ def draw_sparkline(result: dict) -> go.Figure:
 if run_btn:
     with st.spinner("Fetching FPL data..."):
         try:
-            bs, pdf, gw_info = _fetch_fpl_data(gameweek)
+            bs, pdf, gw_info, elo_ratings = _fetch_fpl_data(gameweek)
             st.session_state.bootstrap  = bs
             st.session_state.players_df = pdf
             st.session_state.gw_info    = gw_info
@@ -345,9 +350,9 @@ if run_btn:
             dgw_pids  = set(pdf[pdf["team"].isin(dgw_teams)]["id"].tolist())
             bgw_pids  = set(pdf[pdf["team"].isin(bgw_teams)]["id"].tolist())
 
-            # Fixture-difficulty weights: one multiplier per team per future GW.
+            # Fixture weights: Elo-based when ratings are available, FDR fallback otherwise.
             # Cached alongside bootstrap — no extra network cost on re-run.
-            team_fw = _fetch_fixture_weights(gameweek, remaining)
+            team_fw = _fetch_fixture_weights(gameweek, remaining, elo_ratings or None)
 
             cfg = sim.SimulationConfig(
                 n_iterations=n_iter,

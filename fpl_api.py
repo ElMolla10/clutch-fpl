@@ -167,41 +167,90 @@ def get_players_df(bootstrap: Optional[dict] = None) -> pd.DataFrame:
 _FDR_MULTIPLIER: dict[int, float] = {1: 1.20, 2: 1.10, 3: 1.00, 4: 0.88, 5: 0.75}
 
 
+def get_upcoming_opponents(
+    team_id: int,
+    from_gw: int,
+    n_gws: int,
+    bootstrap: Optional[dict] = None,
+) -> tuple[list[int], list[int]]:
+    """
+    Return (gw_numbers, opponent_team_ids) for the next n_gws gameweeks.
+
+    opponent_team_id is -1 when the team has no fixture in that GW (blank).
+    DGW: only the first opponent is returned — caller can detect DGW separately.
+    Any fetch failure returns -1 (neutral fallback) for that GW.
+    """
+    bs = bootstrap or get_bootstrap()
+    gw_numbers:    list[int] = []
+    opponent_ids:  list[int] = []
+
+    for gw in range(from_gw, from_gw + n_gws):
+        gw_numbers.append(gw)
+        try:
+            fixtures = _get(f"{BASE}/fixtures/?event={gw}")
+            opp = -1
+            for f in fixtures:
+                h, a = f.get("team_h"), f.get("team_a")
+                if h == team_id and a is not None:
+                    opp = int(a)
+                    break
+                if a == team_id and h is not None:
+                    opp = int(h)
+                    break
+            opponent_ids.append(opp)
+        except Exception:
+            opponent_ids.append(-1)
+
+    return gw_numbers, opponent_ids
+
+
 def get_team_fixture_weights(
     gw: int,
     n_gws: int,
     bootstrap: Optional[dict] = None,
+    elo_ratings: Optional[dict] = None,
 ) -> dict[int, list[float]]:
     """
     Per-team fixture difficulty multipliers for the next n_gws gameweeks.
 
     Returns {team_id: [fw_gw0, fw_gw1, ..., fw_gw(n-1)]}.
 
-    - FDR 1 (easiest) → 1.20 · FDR 3 (neutral) → 1.00 · FDR 5 (hardest) → 0.75
-    - No fixture in a GW → 0.0 (blank week; complements bgw_player_ids for the
-      current GW and captures future blanks automatically).
-    - DGW teams (two fixtures) → mean of their FDR multipliers; the extra volume
-      is handled separately by dgw_player_ids / two independent draws.
-    - Any fetch failure → 1.0 (neutral) for that GW to avoid poisoning the sim.
+    When elo_ratings is provided (a {str(team_id): float} dict from elo.py),
+    weights use the Elo win-probability formula: 0.75 + win_prob * 0.45.
+    When elo_ratings is None or empty, falls back to FDR-based multipliers.
+
+    - No fixture in a GW → 0.0 (blank week).
+    - DGW teams (two fixtures) → mean of their two opponent weights.
+    - Any fetch failure → 1.0 (neutral) for that GW.
     """
     bs       = bootstrap or get_bootstrap()
     team_ids = {t["id"] for t in bs.get("teams", [])}
     weights  = {tid: [1.0] * n_gws for tid in team_ids}
+
+    use_elo = bool(elo_ratings)
+
+    if use_elo:
+        # Lazy import avoids circular dependency (elo.py imports fpl_api)
+        from elo import get_fixture_weight as _elo_weight
 
     for i, future_gw in enumerate(range(gw, gw + n_gws)):
         try:
             fixtures   = _get(f"{BASE}/fixtures/?event={future_gw}")
             gw_mults: dict[int, list[float]] = {}
             for f in fixtures:
-                h, a     = f.get("team_h"), f.get("team_a")
-                h_m      = _FDR_MULTIPLIER.get(f.get("team_h_difficulty", 3), 1.0)
-                a_m      = _FDR_MULTIPLIER.get(f.get("team_a_difficulty", 3), 1.0)
+                h, a = f.get("team_h"), f.get("team_a")
+                if use_elo and h is not None and a is not None:
+                    h_m = _elo_weight(int(h), int(a), elo_ratings)
+                    a_m = _elo_weight(int(a), int(h), elo_ratings)
+                else:
+                    h_m = _FDR_MULTIPLIER.get(f.get("team_h_difficulty", 3), 1.0)
+                    a_m = _FDR_MULTIPLIER.get(f.get("team_a_difficulty", 3), 1.0)
                 if h is not None:
                     gw_mults.setdefault(h, []).append(h_m)
                 if a is not None:
                     gw_mults.setdefault(a, []).append(a_m)
             for tid in team_ids:
-                mults          = gw_mults.get(tid)
+                mults           = gw_mults.get(tid)
                 weights[tid][i] = (sum(mults) / len(mults)) if mults else 0.0
         except Exception:
             pass  # leave 1.0 (neutral) on any fetch failure
