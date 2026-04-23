@@ -194,6 +194,8 @@ Open via the sidebar navigation. Requires the main simulation to have been run f
 
 **Sigma ceiling** — `_player_sigma` caps at `max(ppg × 0.8, base × 1.5)`. Without this, a player returning from injury with low season PPG and high recent form can produce sigma > 10, which regularly samples negative or 30+ point gameweeks from a Normal distribution — physically impossible in FPL.
 
+**Fixture-adjusted expected points** — `get_team_fixture_weights` fetches FDR (Fixture Difficulty Rating 1–5) for each upcoming GW and maps them to score multipliers (1.20 / 1.10 / 1.00 / 0.88 / 0.75). Every player in the simulation is scaled by their own team's schedule, not a global weight. A player with a great run of fixtures scores higher expected points in those GWs; a player blanking (0.0) or facing a tough run is penalised accordingly. `simulate_transfer` uses each player's own team fixture weights when computing xP gain per GW — so "bring in X" correctly reflects X's upcoming schedule vs the player going out.
+
 **Bilingual error handling** — the Presser Intel fallback responds in Egyptian Arabic, consistent with the tool's target audience. Internal error state (reason codes, exception details) goes to `logging.warning`, not to the UI.
 
 **Content Creator is a separate page** — the FPL decision engine (Win Probability, Assassin, Transfer Lab, Presser) and the content creation tool (scripts, captions) are different use cases with different users. Streamlit multipage keeps them separate while sharing session state.
@@ -220,5 +222,4 @@ Python 3.11+ recommended (uses `list[int]`, `dict[int, list[int]]` type hints th
 - FPL API is unauthenticated and occasionally flaky — retry logic handles transient 5xx but sustained outages will fail
 - xGI thresholds and inertia threshold are not statistically calibrated against historical FPL data
 - Monte Carlo uses Normal distributions; actual FPL score distributions are right-skewed (hauls are fat-tailed). The model understates haul probability for premium attackers
-- `simulate_transfer` computes expected points from season PPG, not fixture-adjusted xG — a player with a great upcoming run won't show a higher `in_ppg` than their season average reflects
 - Content Creator scripts are generated in Egyptian Arabic (عامية مصرية) and are not suitable for English-language channels without translation

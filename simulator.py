@@ -38,13 +38,12 @@ class ManagerProfile:
 
 @dataclass
 class SimulationConfig:
-    n_iterations:   int   = 10_000
-    remaining_gws:  int   = 5
-    dgw_player_ids: set   = field(default_factory=set)  # 2 draws this GW
-    bgw_player_ids: set   = field(default_factory=set)  # zeroed this GW
-    # fixture_weights: explicit per-GW scalars.
-    # None → uniform 1.0. Provide real difficulty data if you have it.
-    fixture_weights: Optional[list[float]] = None
+    n_iterations:        int            = 10_000
+    remaining_gws:       int            = 5
+    dgw_player_ids:      set            = field(default_factory=set)
+    bgw_player_ids:      set            = field(default_factory=set)
+    fixture_weights:     Optional[list[float]] = None   # global fallback, uniform 1.0
+    team_fixture_weights: Optional[dict] = None         # {team_id: [fw_gw0, ..., fw_gwN]}
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +158,7 @@ def _simulate_squad_xp(
 
     for _, player in starters.iterrows():
         pid     = int(player["id"])
+        team_id = int(player.get("team", 0))
         ppg     = float(player.get("ppg", 0) or 0)
         sigma_i = _player_sigma(player)
         is_bgw  = bool(cfg.bgw_player_ids and pid in cfg.bgw_player_ids)
@@ -168,11 +168,18 @@ def _simulate_squad_xp(
         if is_bgw:
             continue   # genuine zero — no fixture this week
 
-        draws = rng.normal(ppg, sigma_i, size=(n_iter, n_gws)) * fw[None, :]
+        # Fixture weights: team-specific FDR-adjusted schedule if available,
+        # otherwise fall back to the global uniform weights.
+        if cfg.team_fixture_weights and team_id in cfg.team_fixture_weights:
+            player_fw = np.array(cfg.team_fixture_weights[team_id][:n_gws], dtype=float)
+        else:
+            player_fw = fw
+
+        draws = rng.normal(ppg, sigma_i, size=(n_iter, n_gws)) * player_fw[None, :]
 
         if is_dgw:
             # Second independent fixture: fresh draw from same distribution
-            draws += rng.normal(ppg, sigma_i, size=(n_iter, n_gws)) * fw[None, :]
+            draws += rng.normal(ppg, sigma_i, size=(n_iter, n_gws)) * player_fw[None, :]
 
         xp_mat += draws
 
@@ -312,12 +319,22 @@ def simulate_transfer(
         float((l_final - t_mod_final).mean()) - float((l_final - t_base_final).mean()), 1
     )
 
-    # xP gain over remaining GWs (raw points, position-independent)
-    xp_gain_per_gw = [round(
-        (float(players_df[players_df["id"] == player_in_id]["ppg"].iloc[0])
-         - float(players_df[players_df["id"] == player_out_id]["ppg"].iloc[0]))
-        * float(fw[i]), 2
-    ) for i in range(len(fw))]
+    # xP gain per GW — fixture-adjusted: each player scaled by their own team's
+    # FDR multiplier rather than a shared global weight.
+    def _team_fw(row: pd.Series) -> np.ndarray:
+        tid = int(row.get("team", 0))
+        if cfg.team_fixture_weights and tid in cfg.team_fixture_weights:
+            return np.array(cfg.team_fixture_weights[tid][:len(fw)], dtype=float)
+        return fw
+
+    out_fw = _team_fw(out_row)
+    in_fw  = _team_fw(in_row)
+
+    xp_gain_per_gw = [
+        round(float(in_row["ppg"]) * float(in_fw[i])
+              - float(out_row["ppg"]) * float(out_fw[i]), 2)
+        for i in range(len(fw))
+    ]
     total_xp_gain = round(sum(xp_gain_per_gw), 2)
     is_lateral    = abs(total_xp_gain) < inertia_threshold
 

@@ -162,6 +162,53 @@ def get_players_df(bootstrap: Optional[dict] = None) -> pd.DataFrame:
     return players
 
 
+# FDR → score multiplier. Calibrated to average FPL score distributions
+# by difficulty tier; FDR 3 is neutral (1.00).
+_FDR_MULTIPLIER: dict[int, float] = {1: 1.20, 2: 1.10, 3: 1.00, 4: 0.88, 5: 0.75}
+
+
+def get_team_fixture_weights(
+    gw: int,
+    n_gws: int,
+    bootstrap: Optional[dict] = None,
+) -> dict[int, list[float]]:
+    """
+    Per-team fixture difficulty multipliers for the next n_gws gameweeks.
+
+    Returns {team_id: [fw_gw0, fw_gw1, ..., fw_gw(n-1)]}.
+
+    - FDR 1 (easiest) → 1.20 · FDR 3 (neutral) → 1.00 · FDR 5 (hardest) → 0.75
+    - No fixture in a GW → 0.0 (blank week; complements bgw_player_ids for the
+      current GW and captures future blanks automatically).
+    - DGW teams (two fixtures) → mean of their FDR multipliers; the extra volume
+      is handled separately by dgw_player_ids / two independent draws.
+    - Any fetch failure → 1.0 (neutral) for that GW to avoid poisoning the sim.
+    """
+    bs       = bootstrap or get_bootstrap()
+    team_ids = {t["id"] for t in bs.get("teams", [])}
+    weights  = {tid: [1.0] * n_gws for tid in team_ids}
+
+    for i, future_gw in enumerate(range(gw, gw + n_gws)):
+        try:
+            fixtures   = _get(f"{BASE}/fixtures/?event={future_gw}")
+            gw_mults: dict[int, list[float]] = {}
+            for f in fixtures:
+                h, a     = f.get("team_h"), f.get("team_a")
+                h_m      = _FDR_MULTIPLIER.get(f.get("team_h_difficulty", 3), 1.0)
+                a_m      = _FDR_MULTIPLIER.get(f.get("team_a_difficulty", 3), 1.0)
+                if h is not None:
+                    gw_mults.setdefault(h, []).append(h_m)
+                if a is not None:
+                    gw_mults.setdefault(a, []).append(a_m)
+            for tid in team_ids:
+                mults          = gw_mults.get(tid)
+                weights[tid][i] = (sum(mults) / len(mults)) if mults else 0.0
+        except Exception:
+            pass  # leave 1.0 (neutral) on any fetch failure
+
+    return weights
+
+
 # ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------

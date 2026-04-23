@@ -41,6 +41,11 @@ def _fetch_standings(league_id: int) -> list[dict]:
 def _fetch_picks(manager_id: int, gw: int) -> list[int]:
     return fpl_api.get_manager_picks(manager_id, gw)
 
+
+@st.cache_data(ttl=300)
+def _fetch_fixture_weights(gw: int, n_gws: int) -> dict:
+    return fpl_api.get_team_fixture_weights(gw, n_gws)
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -340,11 +345,16 @@ if run_btn:
             dgw_pids  = set(pdf[pdf["team"].isin(dgw_teams)]["id"].tolist())
             bgw_pids  = set(pdf[pdf["team"].isin(bgw_teams)]["id"].tolist())
 
+            # Fixture-difficulty weights: one multiplier per team per future GW.
+            # Cached alongside bootstrap — no extra network cost on re-run.
+            team_fw = _fetch_fixture_weights(gameweek, remaining)
+
             cfg = sim.SimulationConfig(
                 n_iterations=n_iter,
                 remaining_gws=remaining,
                 dgw_player_ids=dgw_pids,
                 bgw_player_ids=bgw_pids,
+                team_fixture_weights=team_fw,
             )
             result = sim.simulate_season(target_profile, leader_profile, pdf, cfg)
             st.session_state.sim_results     = result
