@@ -105,7 +105,10 @@ with st.sidebar:
     target_id  = st.number_input("Your Manager ID", min_value=1, value=1234567, step=1)
     league_id  = st.number_input("Mini-League ID",  min_value=1, value=314,     step=1)
     gameweek   = st.number_input("Current GW",      min_value=1, max_value=38, value=32, step=1)
-    remaining  = st.number_input("GWs Remaining",   min_value=1, max_value=20, value=6,  step=1)
+    eos_check  = st.checkbox("To end of season", value=False)
+    remaining  = max(1, 38 - int(gameweek)) if eos_check else st.number_input(
+        "GWs Remaining", min_value=1, max_value=37, value=6, step=1
+    )
     n_iter     = st.select_slider("MC Iterations", options=[1000, 5000, 10000], value=10000)
 
     st.markdown("---")
